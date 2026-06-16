@@ -42,24 +42,30 @@ say "you had a meeting with X about Y" when the name itself was barely on screen
 ```
 query.py        find_anchors(term) → context_at(ts) per anchor   (raw OCR + audio)
    ↓
-analyze.py      Gemini → { narrative, events[{summary, frame_index, ...}] }
+analyze.py      Gemini → { narrative, moments[{anchor_index, label}] }
    ↓
-render.py       HTML vertical timeline → temp dir → local http.server → browser
+render.py       open browser on "working…" page → run pipeline in background →
+                swap to overview (narrative + clickable moments) via local server
 ```
 
 - **`config.py`** — shared key resolver: `get_key(name)` checks env var, then a
   gitignored `config.json` next to the scripts. Used for both `SCREENPIPE_API_KEY`
-  and `GEMINI_API_KEY`. The config file is what makes keys work in the eventual
+  and `GEMINI_API_KEY`. The config file is what makes keys work in the macOS
   Quick Action (which has neither shell config nor exported env).
 - **`query.py`** — Screenpipe access. `search()`, `search_window()` (per-day
   sampling), `find_anchors()` (term → distinct moments), `context_at()` (±window
   OCR+audio pull), `normalize()` (unifies screen + audio events), and
   `--check` (env/auth/reachability doctor).
-- **`analyze.py`** — `analyze(term, frames, key)` calls Gemini (`gemini-3.5-flash`,
-  REST, structured-JSON output) and returns `{narrative, events}`. Each event has
-  `frame_index` linking back to the source frame for evidence.
-- **`render.py`** — builds the timeline HTML and shows it. Flags: `--days`
+- **`analyze.py`** — two tiers. `analyze_overview(term, frames, anchors, key)`
+  returns `{narrative, moments[{anchor_index, label}]}` (fast — narrative + an
+  ≤8-word label per moment; the structured per-event version doubled latency).
+  `analyze_moment(term, frames, key)` returns a focused `{detail}` paragraph for
+  one zoomed-in moment (Stage 2). Gemini `gemini-3.5-flash`, REST, structured JSON.
+- **`render.py`** — runs the pipeline and serves the overview. Flags: `--days`
   (lookback, default 7), `--window` (context minutes, default 5).
+- **`show-history.sh`** + **`build/ContextTrace.workflow/`** — the macOS Quick
+  Action wrapper and bundle (Phase 3). The wrapper uses absolute paths (Service
+  PATH is minimal) and runs `render.py`; keys come from `config.json`.
 
 ## Screenpipe API — verified facts
 
@@ -93,34 +99,45 @@ render.py       HTML vertical timeline → temp dir → local http.server → br
 ## UI: generated HTML in the browser (no native window)
 
 Full CSS control, stdlib-only. Chrome blocks a `file://` page from loading
-`file://` subresources, so `render.py` does NOT open the file directly:
-1. writes `index.html` + copies referenced screenshots into a temp dir,
-2. references them with **relative paths** (`./frame_NN.jpg`),
-3. starts a **short-lived stdlib `http.server`** on a random port,
-4. opens `http://localhost:PORT/` (an `http://` origin → images load in Chrome),
-5. the server auto-stops a few seconds after the page is served.
+`file://` subresources, so `render.py` serves over a **local stdlib
+`http.server`** (an `http://localhost:PORT` origin → relative-path images load in
+Chrome), never opening the file directly.
 
-Audio events render as a 🎙 transcript card (no screenshot); screen events show
-the screenshot as evidence. The narrative is a headline above the timeline.
+Because the Gemini call is ~15s (and that latency is intrinsic — input size
+barely affects it, output volume does), the server comes up **immediately** on a
+"working…" spinner page, runs the pipeline in a background thread, and the page
+polls `status.json` and swaps to the result when ready (`serve_with_progress`).
+The server shuts down shortly after the result loads (hard cap if compute hangs).
+
+The result page is the **overview**: a narrative paragraph headline, then a tight
+list of clickable **moments** (each = an anchor: ≤8-word label + app/time + a
+screenshot thumbnail, or 🎙 for audio-only moments).
 
 Rejected: base64-embedded images (bloats HTML, files not inspectable); native
 toolkits (Tkinter dated, PyQt heavy, SwiftUI needs Xcode).
 
 ## Status
 
-- ✅ **Phase 1 — `query.py`**: done. Term/time/window/audio fetch + `--check`.
-- ✅ **LLM layer — `analyze.py`** + **`config.py`**: done, verified against live
-  Gemini + Screenpipe.
-- ✅ **Phase 2 — `render.py`**: done. Narrative-led audio-aware timeline in Chrome.
-- ⏳ **Phase 3 — macOS Quick Action**: not started. A thin shell script that
-  captures the selection and runs `render.py`. Keys come from `config.json` (the
-  Service env has no shell exports). Build and verify the pipeline standalone
-  first (already done), then wrap it.
+- ✅ **Phase 1 — `query.py`**: term/time/window/audio fetch + `--check`.
+- ✅ **LLM layer — `analyze.py`** + **`config.py`**: verified against live Gemini.
+- ✅ **Phase 2 — `render.py`**: two-tier overview (narrative + labeled moments),
+  audio-aware, with the instant "working…" page.
+- ✅ **Phase 3 — macOS Quick Action**: `show-history.sh` + `ContextTrace.workflow`,
+  installed to `~/Library/Services/`. Highlight text → Services → "Show History" →
+  spinner → overview. Verified working in a stripped Service environment.
+- ⏳ **Stage 2 — click-to-zoom**: deferred. Clicking a moment should re-run
+  `analyze_moment` on just that anchor (tighter window/frames → richer detail)
+  and render it inline. The long-lived server in `serve_with_progress` is the
+  foundation; needs a `/zoom?anchor=N` route + idle-timeout lifecycle.
 
 ### Open / tunable
-- **Window breadth tradeoff:** ±5 min pulls real but incidental activity (e.g.
-  unrelated browsing) into the story. Narrower = tighter but risks clipping a
-  meeting. Tune `--window` per demo.
+- **Gemini latency (~15s) is intrinsic** — output volume drives it, not input.
+  Don't try to fix it by trimming frames (measured: no effect, and hurts the
+  narrative). The "working…" page addresses *perceived* latency instead.
+- **Window breadth tradeoff:** ±5 min pulls real but incidental activity into the
+  story. Narrower = tighter but risks clipping a meeting. Tune `--window`.
+- **macOS notifications** from the Service land silently in Notification Center
+  (low priority) — not worth fixing; the browser working-page is the feedback.
 - Deep-linking back into the source app is **out of scope** (unstable); the
   screenshot/transcript is the context.
 
