@@ -35,45 +35,126 @@ import query
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
-def build_html(narrative, events, query_text, image_for_frame, frame_meta):
-    """Render the analyzed provenance as a vertical-timeline HTML document.
+# Both pages poll status.json; when state flips from "working" the page reloads
+# to pick up the freshly-written result (or error) HTML.
+_POLL_SCRIPT = """
+<script>
+  async function poll() {
+    try {
+      const r = await fetch('status.json?' + Date.now());
+      const s = await r.json();
+      if (s.state !== 'working') { location.reload(); return; }
+    } catch (e) {}
+    setTimeout(poll, 1000);
+  }
+  poll();
+</script>
+"""
 
-    `events` are the LLM-summarized distinct events (each with `frame_index`).
-    `image_for_frame[idx]` is the relative screenshot filename for frame `idx`,
-    or None. `frame_meta[idx]` carries {is_audio, speaker} for that frame so audio
-    events render as a transcript card rather than a missing screenshot. The
-    narrative is shown as a headline above the timeline.
+
+def build_working_html(query_text):
+    """Instant placeholder shown while the pipeline runs in the background."""
+    q = html.escape(query_text)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Context Trace — “{q}”</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #f6f7f9; color: #1c1d21;
+  }}
+  @media (prefers-color-scheme: dark) {{ body {{ background: #16171b; color: #e6e7ea; }} }}
+  .box {{ text-align: center; }}
+  .spinner {{
+    width: 32px; height: 32px; margin: 0 auto 16px; border-radius: 50%;
+    border: 3px solid rgba(47,111,237,.25); border-top-color: #2f6fed;
+    animation: spin 0.8s linear infinite;
+  }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .q {{ color: #2f6fed; font-weight: 600; }}
+  .sub {{ color: #8a8d96; font-size: 13px; margin-top: 6px; }}
+</style></head>
+<body>
+  <div class="box">
+    <div class="spinner"></div>
+    <div>Tracing <span class="q">“{q}”</span>…</div>
+    <div class="sub">Searching captures and reconstructing the story</div>
+  </div>
+  {_POLL_SCRIPT}
+</body></html>"""
+
+
+def build_error_html(query_text, message):
+    """Shown if the background pipeline fails."""
+    q = html.escape(query_text)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Context Trace — error</title>
+<style>
+  body {{ font: 15px/1.5 -apple-system, sans-serif; margin: 0; min-height: 100vh;
+         display: grid; place-items: center; background: #f6f7f9; color: #1c1d21; }}
+  @media (prefers-color-scheme: dark) {{ body {{ background: #16171b; color: #e6e7ea; }} }}
+  .box {{ max-width: 480px; text-align: center; }}
+  code {{ display: block; margin-top: 10px; color: #c0392b; font-size: 13px; }}
+</style></head>
+<body><div class="box">
+  <div>Couldn’t trace <strong>“{q}”</strong>.</div>
+  <code>{html.escape(message)}</code>
+</div></body></html>"""
+
+
+def _bundle_app(bundle):
+    """Most representative app name for a moment (first non-audio screen frame)."""
+    for f in bundle:
+        if not f["is_audio"] and f.get("app_name"):
+            return f["app_name"]
+    return bundle[0]["app_name"] if bundle else ""
+
+
+def _bundle_thumb(bundle, workdir, i):
+    """Copy one displayable screenshot from a moment's bundle; return rel name or None.
+
+    Some screen frames point at compacted .mp4 video, not images — skip those.
     """
-    cards = []
-    for e in events:
-        summary = html.escape(e.get("summary") or "")
-        app = html.escape(e.get("app") or "")
-        ts = (e.get("timestamp") or "").replace("T", " ")[:19]
-        idx = e.get("frame_index")
-        meta_info = frame_meta.get(idx, {})
-        img = image_for_frame.get(idx)
+    for f in bundle:
+        src = f.get("screenshot")
+        if src and Path(src).suffix.lower() in IMAGE_EXTS and Path(src).exists():
+            name = f"moment_{i:02d}{Path(src).suffix}"
+            shutil.copyfile(src, workdir / name)
+            return name
+    return None
 
-        if meta_info.get("is_audio"):
-            spk = html.escape(meta_info.get("speaker") or "")
-            badge = f'🎙 audio{" · " + spk if spk else ""}'
-            evidence = f'<div class="badge">{badge}</div>'
-        elif img:
-            evidence = f'<img class="shot" src="./{html.escape(img)}" loading="lazy" alt="screenshot">'
-        else:
-            evidence = '<div class="shot noshot">no screenshot</div>'
 
-        meta = " · ".join(p for p in (app, ts) if p)
-        cards.append(f"""
-        <li class="event">
-          <div class="dot"></div>
-          <div class="card">
-            <p class="summary">{summary}</p>
+def build_html(narrative, moments, query_text):
+    """Render the overview: narrative paragraph + a tight list of moments.
+
+    `moments` is a list of dicts: {index, label, app, timestamp, image (rel
+    filename or None)}. Each row is clickable (Stage 2 will wire the zoom).
+    """
+    rows = []
+    for m in moments:
+        label = html.escape(m.get("label") or "(moment)")
+        app = html.escape(m.get("app") or "")
+        ts = (m.get("timestamp") or "").replace("T", " ")[11:19]  # HH:MM:SS
+        day = (m.get("timestamp") or "")[:10]
+        meta = " · ".join(p for p in (app, f"{day} {ts}".strip()) if p)
+        img = m.get("image")
+        thumb = (
+            f'<img class="thumb" src="./{html.escape(img)}" loading="lazy" alt="">'
+            if img
+            else '<div class="thumb noshot">🎙</div>'
+        )
+        rows.append(f"""
+        <li class="moment" data-anchor="{m['index']}">
+          {thumb}
+          <div class="mtext">
+            <p class="label">{label}</p>
             <div class="meta">{html.escape(meta)}</div>
-            {evidence}
           </div>
         </li>""")
 
-    body = "\n".join(cards) if cards else '<p class="empty">No history found.</p>'
+    body = "\n".join(rows) if rows else '<p class="empty">No moments found.</p>'
     q = html.escape(query_text)
     narrative_html = html.escape(narrative) if narrative else ""
     return f"""<!doctype html>
@@ -99,40 +180,24 @@ def build_html(narrative, events, query_text, image_for_frame, frame_meta):
     padding: 14px 16px; font-size: 15px; line-height: 1.55;
     box-shadow: 0 1px 3px rgba(0,0,0,.08);
   }}
-  .sub {{ color: #8a8d96; font-size: 13px; margin: 14px 0 0; }}
-  ul.timeline {{
-    list-style: none; max-width: 720px; margin: 0 auto; padding: 0;
-    position: relative;
+  .sub {{ color: #8a8d96; font-size: 13px; margin: 18px 0 8px; font-weight: 600;
+          text-transform: uppercase; letter-spacing: .04em; }}
+  ul.moments {{ list-style: none; max-width: 720px; margin: 0 auto; padding: 0; }}
+  .moment {{
+    display: flex; gap: 12px; align-items: center; background: #fff;
+    border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer;
+    box-shadow: 0 1px 2px rgba(0,0,0,.06); transition: box-shadow .12s, transform .12s;
   }}
-  ul.timeline::before {{
-    content: ""; position: absolute; left: 7px; top: 6px; bottom: 6px;
-    width: 2px; background: #d6d9e0;
+  .moment:hover {{ box-shadow: 0 2px 10px rgba(47,111,237,.18); transform: translateY(-1px); }}
+  @media (prefers-color-scheme: dark) {{ .moment {{ background: #22242a; box-shadow: none; }} }}
+  .thumb {{
+    width: 96px; height: 60px; object-fit: cover; border-radius: 6px; flex: none;
+    border: 1px solid rgba(0,0,0,.08); background: rgba(0,0,0,.03);
   }}
-  @media (prefers-color-scheme: dark) {{ ul.timeline::before {{ background: #34373f; }} }}
-  .event {{ position: relative; padding: 0 0 22px 36px; }}
-  .dot {{
-    position: absolute; left: 0; top: 6px; width: 16px; height: 16px;
-    border-radius: 50%; background: #2f6fed; border: 3px solid #f6f7f9;
-  }}
-  @media (prefers-color-scheme: dark) {{ .dot {{ border-color: #16171b; }} }}
-  .card {{
-    background: #fff; border-radius: 12px; padding: 14px 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.08);
-  }}
-  .summary {{ margin: 0 0 6px; font-weight: 500; }}
+  .thumb.noshot {{ display: grid; place-items: center; font-size: 22px; }}
+  .mtext {{ min-width: 0; }}
+  .label {{ margin: 0 0 3px; font-weight: 500; }}
   .meta {{ color: #8a8d96; font-size: 12px; font-variant-numeric: tabular-nums; }}
-  .shot {{
-    display: block; width: 100%; border-radius: 8px; margin-top: 6px;
-    border: 1px solid rgba(0,0,0,.08);
-  }}
-  .noshot {{
-    display: grid; place-items: center; height: 80px; color: #9a9da6;
-    font-size: 13px; background: rgba(0,0,0,.03);
-  }}
-  .badge {{
-    display: inline-block; margin-top: 4px; padding: 3px 10px; font-size: 12px;
-    border-radius: 999px; background: rgba(47,111,237,.12); color: #2f6fed;
-  }}
   .empty {{ text-align: center; color: #8a8d96; max-width: 720px; margin: 40px auto; }}
 </style>
 </head>
@@ -140,9 +205,9 @@ def build_html(narrative, events, query_text, image_for_frame, frame_meta):
   <header>
     <h1>Data lineage for <span class="q">“{q}”</span></h1>
     <div class="narrative">{narrative_html}</div>
-    <div class="sub">{len(events)} distinct event(s)</div>
+    <div class="sub">{len(moments)} moment(s)</div>
   </header>
-  <ul class="timeline">
+  <ul class="moments">
     {body}
   </ul>
 </body>
@@ -150,27 +215,44 @@ def build_html(narrative, events, query_text, image_for_frame, frame_meta):
 """
 
 
-def serve_and_open(workdir, lifetime=8.0):
+def serve_with_progress(workdir, query_text, compute, lifetime=8.0):
     """Serve `workdir` on a random free port, open it in the browser, then stop.
 
-    The server is bound to localhost only and shuts down after `lifetime`
-    seconds — long enough for the page (and its images) to load, short enough to
-    leave nothing running after the demo.
+    Opens immediately on a placeholder page, runs `compute` in the background,
+    and the page polls status.json to swap to the result when ready. The server
+    is bound to localhost only and shuts down `lifetime` seconds after the result
+    is ready (or after a generous cap if compute hangs).
     """
+    # Initial state: placeholder page + working status, so the browser has
+    # something to show the instant it opens.
+    (workdir / "status.json").write_text('{"state": "working"}')
+    (workdir / "index.html").write_text(build_working_html(query_text), encoding="utf-8")
+
     handler = functools.partial(
         http.server.SimpleHTTPRequestHandler, directory=str(workdir)
     )
     httpd = http.server.HTTPServer(("127.0.0.1", 0), handler)
     port = httpd.server_address[1]
-
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
     url = f"http://localhost:{port}/index.html"
-    print(f"Serving timeline at {url} (auto-stops in {lifetime:.0f}s)")
+    print(f"Serving at {url}")
     webbrowser.open(url)
 
-    timer = threading.Timer(lifetime, httpd.shutdown)
-    timer.start()
-    timer.join()
+    def run():
+        try:
+            html_out = compute(workdir)
+        except Exception as e:  # noqa: BLE001 — show the failure on the page, don't crash silently
+            html_out = build_error_html(query_text, str(e))
+        (workdir / "index.html").write_text(html_out, encoding="utf-8")
+        (workdir / "status.json").write_text('{"state": "ready"}')
+        # Give the page time to reload + load its images before we stop serving.
+        threading.Timer(lifetime, httpd.shutdown).start()
+
+    threading.Thread(target=run, daemon=True).start()
+    # Hard cap so a hung compute can't keep the process (and server) alive forever.
+    threading.Timer(180, httpd.shutdown).start()
+    httpd.serve_forever()
 
 
 def main():
@@ -185,49 +267,35 @@ def main():
         sys.exit("No Screenpipe API key found. Run `python3 query.py --check` for details.")
     gemini_key = config.require_key("GEMINI_API_KEY")
 
-    # The term anchors WHEN it was relevant; the substance of each moment (e.g. a
-    # meeting's audio) is then pulled from unfiltered context around that time.
-    try:
+    def compute(workdir):
+        """Run the full pipeline and return the result HTML. Runs in background
+        AFTER the browser is already showing the working page."""
+        # The term anchors WHEN it was relevant; the substance of each moment
+        # (e.g. a meeting's audio) is pulled from unfiltered context around that
+        # time. Keep each anchor's bundle so a moment can supply its screenshot.
         anchors = query.find_anchors(args.query, sp_key, days=args.days)
-        frames = []
-        for ts in anchors:
-            frames.extend(query.context_at(ts, sp_key, window_minutes=args.window))
-    except Exception as e:  # noqa: BLE001 — surface any fetch failure plainly for the demo
-        sys.exit(f"Query failed: {e}. Run `python3 query.py --check`.")
+        bundles = [query.context_at(ts, sp_key, window_minutes=args.window) for ts in anchors]
+        frames = [f for b in bundles for f in b]
+        if not frames:
+            return build_error_html(args.query, "No history found for that text.")
 
-    if not frames:
-        sys.exit("No history found for that text.")
+        result = analyze.analyze_overview(args.query, frames, anchors, gemini_key)
+        narrative = result.get("narrative", "")
+        labels = {m["anchor_index"]: m.get("label", "") for m in result.get("moments", [])}
 
-    try:
-        result = analyze.analyze(args.query, frames, gemini_key)
-    except Exception as e:  # noqa: BLE001 — surface analysis failure plainly for the demo
-        sys.exit(f"Analysis failed: {e}")
-    narrative, events = result.get("narrative", ""), result.get("events", [])
+        moments = []
+        for i, (ts, bundle) in enumerate(zip(anchors, bundles)):
+            moments.append({
+                "index": i,
+                "label": labels.get(i, ""),
+                "timestamp": ts,
+                "app": _bundle_app(bundle),
+                "image": _bundle_thumb(bundle, workdir, i),
+            })
+        return build_html(narrative, moments, args.query)
 
-    # Copy only the screenshots the LLM's events actually reference, keyed by
-    # frame index so build_html can look each one up.
     workdir = Path(tempfile.mkdtemp(prefix="context-trace-"))
-    image_for_frame = {}
-    frame_meta = {}
-    for e in events:
-        idx = e.get("frame_index")
-        if idx is None or not (0 <= idx < len(frames)):
-            continue
-        frame = frames[idx]
-        frame_meta[idx] = {"is_audio": frame["is_audio"], "speaker": frame.get("speaker")}
-        src = frame["screenshot"]
-        # Only image files are displayable; some screen frames point at a
-        # compacted .mp4 video segment, which can't render in an <img>.
-        if src and Path(src).suffix.lower() in IMAGE_EXTS and Path(src).exists():
-            name = f"frame_{idx:02d}{Path(src).suffix}"
-            shutil.copyfile(src, workdir / name)
-            image_for_frame[idx] = name
-
-    (workdir / "index.html").write_text(
-        build_html(narrative, events, args.query, image_for_frame, frame_meta),
-        encoding="utf-8",
-    )
-    serve_and_open(workdir)
+    serve_with_progress(workdir, args.query, compute)
 
 
 if __name__ == "__main__":
