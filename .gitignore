@@ -5,3 +5,6 @@ config.json
 # Python
 __pycache__/
 *.pyc
+
+# Transient run output
+last-run.log
