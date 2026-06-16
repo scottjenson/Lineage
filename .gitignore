@@ -1,0 +1,7 @@
+# Never commit API keys
+config.json
+.screenpipe_key
+
+# Python
+__pycache__/
+*.pyc
